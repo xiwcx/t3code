@@ -923,6 +923,21 @@ export const make = Effect.gen(function* () {
       Effect.ignore,
     );
 
+  const saveLiveRoutesLocked = Effect.fn("EnvironmentRegistry.saveLiveRoutesLocked")(function* (
+    entry: ConnectionCatalogEntry,
+  ) {
+    const environmentId = entry.target.environmentId;
+    yield* registrations.setRoutes(environmentId, persistedRoutes(entry));
+    const lease = (yield* SubscriptionRef.get(serviceScopes)).get(environmentId);
+    if (lease !== undefined) {
+      yield* SubscriptionRef.update(serviceScopes, (current) =>
+        new Map(current).set(environmentId, { ...lease, entry }),
+      );
+    }
+    yield* SubscriptionRef.update(entries, (current) => new Map(current).set(environmentId, entry));
+    return Option.some(entry);
+  });
+
   const refreshRelayLabel = Effect.fn("EnvironmentRegistry.refreshRelayLabel")(function* (
     environmentId: EnvironmentId,
     scope: Scope.Scope,
@@ -944,27 +959,13 @@ export const make = Effect.gen(function* () {
 
         const updated = {
           ...relay,
-          target: new RelayConnectionTarget({
-            environmentId,
-            label: descriptor.label,
-          }),
+          target: new RelayConnectionTarget({ environmentId, label: descriptor.label }),
         };
         const next = entryWithRoutes(
           entry,
           routes.map((route) => (route === relay ? updated : route)),
         );
-        yield* Effect.uninterruptible(
-          Effect.gen(function* () {
-            yield* registrations.setRoutes(environmentId, persistedRoutes(next));
-            yield* SubscriptionRef.update(serviceScopes, (current) =>
-              new Map(current).set(environmentId, { ...lease, entry: next }),
-            );
-            yield* SubscriptionRef.update(entries, (current) =>
-              new Map(current).set(environmentId, next),
-            );
-          }),
-        );
-        return Option.some(next);
+        return yield* Effect.uninterruptible(saveLiveRoutesLocked(next));
       }),
     ).pipe(
       Effect.catch((error) =>
@@ -1021,17 +1022,7 @@ export const make = Effect.gen(function* () {
           }
           yield* profiles.put(profile);
         }
-        yield* registrations.setRoutes(input.environmentId, persistedRoutes(next));
-        const lease = (yield* SubscriptionRef.get(serviceScopes)).get(input.environmentId);
-        if (lease !== undefined) {
-          yield* SubscriptionRef.update(serviceScopes, (current) =>
-            new Map(current).set(input.environmentId, { ...lease, entry: next }),
-          );
-        }
-        yield* SubscriptionRef.update(entries, (current) =>
-          new Map(current).set(input.environmentId, next),
-        );
-        return Option.some(next);
+        return yield* saveLiveRoutesLocked(next);
       }),
     ).pipe(
       Effect.catch((error) =>
