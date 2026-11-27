@@ -151,6 +151,9 @@ type EstablishmentEvent =
 
 export interface EnvironmentSupervisorOptions {
   readonly initiallyDesired?: boolean;
+  readonly refreshRelayLabel?: (
+    descriptor: NonNullable<PreparedConnection["descriptor"]>,
+  ) => Effect.Effect<Option.Option<ConnectionCatalogEntry>>;
   readonly learnRoutes?: (input: {
     readonly activeRoute: ConnectionRoute;
     readonly reported: ReadonlyArray<ReportedEndpoint>;
@@ -1049,6 +1052,13 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
         yield* Ref.update(routeCooldowns, (current) =>
           new Map(current).set(switchingTo.value, until),
         );
+      }
+    }
+    const { descriptor } = active.lease.prepared;
+    if (isRelayLease(active.lease) && descriptor !== undefined && options?.refreshRelayLabel) {
+      const updated = yield* options.refreshRelayLabel(descriptor);
+      if (Option.isSome(updated)) {
+        yield* Ref.set(currentEntry, updated.value);
       }
     }
     const currentIntent = yield* Ref.get(intent);

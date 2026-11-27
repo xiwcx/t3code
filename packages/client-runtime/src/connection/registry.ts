@@ -1,6 +1,6 @@
 import { msg } from "gt-i18n";
 import { translatableDetail } from "../errors/translatable.ts";
-import { EnvironmentId } from "@t3tools/contracts";
+import { EnvironmentId, type ExecutionEnvironmentDescriptor } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Equal from "effect/Equal";
@@ -35,7 +35,7 @@ import type {
   PersistedConnectionTarget,
   SupervisorConnectionState,
 } from "./model.ts";
-import { ConnectionBlockedError } from "./model.ts";
+import { ConnectionBlockedError, RelayConnectionTarget } from "./model.ts";
 import * as Persistence from "../platform/persistence.ts";
 import * as EnvironmentSupervisor from "./supervisor.ts";
 import * as ConnectionDriver from "./driver.ts";
@@ -369,6 +369,7 @@ export const make = Effect.gen(function* () {
             // Seed the intent to avoid publishing a false switched-off state
             // before an enabled, compatible environment starts connecting.
             initiallyDesired: entry.enabled && entry.unsupportedReason === undefined,
+            refreshRelayLabel: (descriptor) => refreshRelayLabel(environmentId, scope, descriptor),
             learnRoutes: (input) => learnRoutes({ environmentId, ...input }),
           }).pipe(
             Effect.provideService(Connectivity.Connectivity, connectivity),
@@ -922,6 +923,60 @@ export const make = Effect.gen(function* () {
       Effect.ignore,
     );
 
+  const saveLiveRoutesLocked = Effect.fn("EnvironmentRegistry.saveLiveRoutesLocked")(function* (
+    entry: ConnectionCatalogEntry,
+  ) {
+    const environmentId = entry.target.environmentId;
+    yield* registrations.setRoutes(environmentId, persistedRoutes(entry));
+    const lease = (yield* SubscriptionRef.get(serviceScopes)).get(environmentId);
+    if (lease !== undefined) {
+      yield* SubscriptionRef.update(serviceScopes, (current) =>
+        new Map(current).set(environmentId, { ...lease, entry }),
+      );
+    }
+    yield* SubscriptionRef.update(entries, (current) => new Map(current).set(environmentId, entry));
+    return Option.some(entry);
+  });
+
+  const refreshRelayLabel = Effect.fn("EnvironmentRegistry.refreshRelayLabel")(function* (
+    environmentId: EnvironmentId,
+    scope: Scope.Scope,
+    descriptor: ExecutionEnvironmentDescriptor,
+  ) {
+    if (descriptor.environmentId !== environmentId) return Option.none<ConnectionCatalogEntry>();
+    return yield* withLeaseLock(
+      environmentId,
+      Effect.gen(function* () {
+        const lease = (yield* SubscriptionRef.get(serviceScopes)).get(environmentId);
+        if (lease?.scope !== scope) return Option.none<ConnectionCatalogEntry>();
+
+        const entry = yield* getEntry(environmentId);
+        const routes = connectionRoutes(entry);
+        const relay = routes.find((route) => route.target._tag === "RelayConnectionTarget");
+        if (relay === undefined || relay.target.label === descriptor.label) {
+          return Option.none<ConnectionCatalogEntry>();
+        }
+
+        const updated = {
+          ...relay,
+          target: new RelayConnectionTarget({ environmentId, label: descriptor.label }),
+        };
+        const next = entryWithRoutes(
+          entry,
+          routes.map((route) => (route === relay ? updated : route)),
+        );
+        return yield* Effect.uninterruptible(saveLiveRoutesLocked(next));
+      }),
+    ).pipe(
+      Effect.catch((error) =>
+        Effect.logWarning("Could not refresh the saved relay label.", {
+          environmentId,
+          error,
+        }).pipe(Effect.as(Option.none<ConnectionCatalogEntry>())),
+      ),
+    );
+  });
+
   // Plain HTTP routes are unusable from an HTTPS page, which blocks mixed content.
   const allowInsecureRoutes =
     typeof globalThis.location === "undefined" || globalThis.location.protocol !== "https:";
@@ -967,17 +1022,7 @@ export const make = Effect.gen(function* () {
           }
           yield* profiles.put(profile);
         }
-        yield* registrations.setRoutes(input.environmentId, persistedRoutes(next));
-        const lease = (yield* SubscriptionRef.get(serviceScopes)).get(input.environmentId);
-        if (lease !== undefined) {
-          yield* SubscriptionRef.update(serviceScopes, (current) =>
-            new Map(current).set(input.environmentId, { ...lease, entry: next }),
-          );
-        }
-        yield* SubscriptionRef.update(entries, (current) =>
-          new Map(current).set(input.environmentId, next),
-        );
-        return Option.some(next);
+        return yield* saveLiveRoutesLocked(next);
       }),
     ).pipe(
       Effect.catch((error) =>

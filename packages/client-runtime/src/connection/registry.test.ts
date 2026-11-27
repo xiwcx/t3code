@@ -168,6 +168,7 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
     ) => Effect.Effect<ConnectionBlockedError | undefined>;
     readonly initialDisabled?: ReadonlyArray<EnvironmentId>;
     readonly directEndpoints?: ServerConfig["directEndpoints"];
+    readonly descriptor?: Effect.Effect<ExecutionEnvironmentDescriptor>;
   },
 ) {
   const storedTargets = yield* Ref.make<ReadonlyArray<ConnectionTarget>>(initialTargets);
@@ -390,8 +391,10 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
         target._tag === "BearerConnectionTarget"
           ? yield* credentialStore.get(target.connectionId)
           : Option.none();
+      const descriptor = options?.descriptor === undefined ? undefined : yield* options.descriptor;
       const prepared: PreparedConnection = {
         ...PREPARED,
+        ...(descriptor === undefined ? {} : { descriptor }),
         environmentId: target.environmentId,
         label: target.label,
         httpAuthorization:
@@ -571,6 +574,81 @@ describe("EnvironmentRegistry", () => {
         expect(yield* Ref.get(commits)).toBe(1);
       }).pipe(Effect.provide(harness.layer), Effect.scoped);
     }),
+  );
+
+  it.effect.each([
+    { matches: true, expectedLabel: "bar" },
+    { matches: false, expectedLabel: "foo" },
+  ])(
+    "refreshes a relay label on reconnect only when the descriptor matches ($matches)",
+    ({ matches, expectedLabel }) =>
+      Effect.gen(function* () {
+        const environmentId = EnvironmentId.make("synthetic-relay");
+        const relay = new RelayConnectionTarget({ environmentId, label: "foo" });
+        const fallback = new BearerConnectionTarget({ ...BEARER_TARGET, environmentId });
+        const profile = new BearerConnectionProfile({ ...BEARER_PROFILE, environmentId });
+        const descriptor = yield* Ref.make<ExecutionEnvironmentDescriptor>({
+          environmentId,
+          label: "foo",
+          platform: { os: "linux", arch: "x64" },
+          serverVersion: "1.0.0",
+          orchestrationProtocolVersion: ORCHESTRATION_PROTOCOL_VERSION,
+          capabilities: { repositoryIdentity: true },
+        });
+        const harness = yield* makeHarness(
+          [relay, fallback],
+          [profile],
+          [[fallback.connectionId, BEARER_CREDENTIAL]],
+          { descriptor: Ref.get(descriptor) },
+        );
+
+        yield* Effect.gen(function* () {
+          const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+          yield* registry.start;
+          const initial = yield* awaitConnectionState(
+            registry,
+            environmentId,
+            (state) => state.phase === "connected",
+          );
+          expect(
+            (yield* SubscriptionRef.get(registry.entries)).get(environmentId)?.target.label,
+          ).toBe("foo");
+
+          yield* Ref.update(descriptor, (current) => ({
+            ...current,
+            environmentId: matches ? environmentId : EnvironmentId.make("synthetic-other"),
+            label: "bar",
+          }));
+          const [session] = yield* Ref.get(harness.sessions);
+          yield* Deferred.fail(
+            session!.closed,
+            new ConnectionTransientError({ reason: "transport", detail: "foo" }),
+          );
+          yield* awaitConnectionState(registry, environmentId, (state) => state.retryAt !== null);
+          yield* registry.retryNow(environmentId);
+          yield* awaitConnectionState(
+            registry,
+            environmentId,
+            (state) => state.phase === "connected" && state.generation > initial.generation,
+          );
+          expect(
+            (yield* SubscriptionRef.get(registry.entries)).get(environmentId)?.target.label,
+          ).toBe(expectedLabel);
+          expect(yield* Ref.get(harness.sessions)).toHaveLength(2);
+        }).pipe(Effect.provide(harness.layer));
+
+        yield* Effect.gen(function* () {
+          const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+          const entry = (yield* SubscriptionRef.get(registry.entries)).get(environmentId);
+          expect(entry?.target.label).toBe(expectedLabel);
+          expect(entry?.alternateRoutes).toEqual([
+            { target: fallback, profile: Option.some(profile) },
+          ]);
+          expect((yield* Ref.get(harness.storedCredentials)).get(fallback.connectionId)).toEqual(
+            BEARER_CREDENTIAL,
+          );
+        }).pipe(Effect.provide(harness.layer));
+      }),
   );
 
   it.effect("does not acquire a session after the registry scope has already closed", () =>
